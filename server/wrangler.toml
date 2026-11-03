@@ -1,0 +1,12 @@
+name = "remote-signaling"
+main = "src/index.ts"
+compatibility_date = "2025-04-01"
+[durable_objects]
+bindings = [{ name = "HUB", class_name = "SignalingHub" }]
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["SignalingHub"]
+# TURN_DAILY_BUDGET: max TURN credential issuances per UTC day; 0/unset disables TURN.
+[vars]
+TURN_DAILY_BUDGET = "500"
+# Secrets (never put in this file): TURN_KEY_ID, TURN_KEY_API_TOKEN -> see DEPLOY.md

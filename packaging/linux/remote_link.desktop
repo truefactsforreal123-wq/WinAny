@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=RemoteLink
+Comment=Consent-first remote access client
+Exec=remote_link
+Icon=remote_link
+Categories=Network;RemoteAccess;
+Terminal=false

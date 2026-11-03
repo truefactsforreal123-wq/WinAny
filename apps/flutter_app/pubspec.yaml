@@ -1,0 +1,29 @@
+﻿name: remote_link
+description: Consent-first remote access client
+publish_to: none
+version: 0.1.0+1
+environment:
+  sdk: '>=3.6.0 <4.0.0'
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^2.6.1
+  flutter_secure_storage: ^9.2.4
+  flutter_webrtc: 1.6.3
+  remote_transport:
+    path: ../../packages/remote_transport
+  tv_bridge:
+    path: ../../packages/tv_bridge
+  ffi: ^2.1.4
+  drift: ^2.28.0
+  sqlite3_flutter_libs: ^0.5.39
+  path_provider: ^2.1.5
+  path: ^1.9.1
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+flutter:
+  uses-material-design: true
+
+

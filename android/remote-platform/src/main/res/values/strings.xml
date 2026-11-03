@@ -1,0 +1,3 @@
+<resources>
+    <string name="remote_accessibility_description">Remote Link can send taps, swipes, navigation actions and text to this device only during a session you explicitly allow. A persistent notification provides a Stop action. It does not read or control the device while no session is active. Never grant access to someone you do not trust.</string>
+</resources>
