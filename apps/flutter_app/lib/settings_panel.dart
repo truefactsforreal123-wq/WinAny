@@ -5,9 +5,9 @@ import 'package:flutter/material.dart';
 import 'signaling.dart';
 import 'update_check.dart';
 
-// Cloudflare R2 public dev URL (rate-limited): replace with a custom domain later.
+// Update files live in the R2 bucket remote-link-updates, served via its custom domain.
 const kUpdateManifestBase =
-    'https://pub-20e92ad39c8e4499be34dd6871d850ef.r2.dev/update-';
+    'https://updates.mixed-tools.site/update-';
 
 /// Passed by scripts/build-release.ps1 (--dart-define=APP_VERSION); the default mirrors pubspec.yaml.
 const kAppVersion = String.fromEnvironment('APP_VERSION', defaultValue: '0.1.0');

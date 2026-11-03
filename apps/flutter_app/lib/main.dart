@@ -44,7 +44,7 @@ class Dashboard extends ConsumerStatefulWidget {
 class _DashboardState extends ConsumerState<Dashboard>
     with WidgetsBindingObserver {
   final endpoint = TextEditingController(
-    text: 'wss://remote-signaling.mohamedelmahrouky04.workers.dev/v1/ws',
+    text: 'wss://signal.mixed-tools.site/v1/ws',
   );
   final peer = TextEditingController();
   final outgoingFile = TextEditingController();

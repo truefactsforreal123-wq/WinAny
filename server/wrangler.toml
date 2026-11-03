@@ -1,6 +1,8 @@
 name = "remote-signaling"
 main = "src/index.ts"
 compatibility_date = "2025-04-01"
+workers_dev = true
+routes = [{ pattern = "signal.mixed-tools.site", custom_domain = true }]
 [durable_objects]
 bindings = [{ name = "HUB", class_name = "SignalingHub" }]
 [[migrations]]
