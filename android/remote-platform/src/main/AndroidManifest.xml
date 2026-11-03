@@ -11,8 +11,6 @@
         </service>
         <service android:name=".CaptureService" android:exported="false"
             android:foregroundServiceType="mediaProjection" />
-        <service android:name=".CaptureService" android:exported="false"
-            android:foregroundServiceType="mediaProjection" />
         <service android:name=".SessionIndicatorService" android:exported="false"
             android:foregroundServiceType="specialUse">
             <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"

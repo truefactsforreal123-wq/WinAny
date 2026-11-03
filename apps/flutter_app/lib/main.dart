@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 
 import 'dart:io';
 import 'dart:async';
-import 'dart:math' as math;
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -13,14 +12,43 @@ import 'direct_panel.dart';
 import 'tv_service.dart';
 import 'tv_panel.dart';
 import 'settings_panel.dart';
-import 'video_pointer.dart';
+import 'session_view.dart';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 
 final signalingProvider = ChangeNotifierProvider<Signaling>(
   (ref) => Signaling(),
 );
-void main() => runApp(const ProviderScope(child: RemoteLinkApp()));
+void main() {
+  runZonedGuarded(() {
+    WidgetsFlutterBinding.ensureInitialized();
+    FlutterError.onError = (details) {
+      FlutterError.presentError(details);
+      _logCrash('${details.exceptionAsString()}');
+    };
+    runApp(const ProviderScope(child: RemoteLinkApp()));
+  }, (error, stack) => _logCrash('$error'));
+}
+
+Future<void> Function(String)? _crashAudit; // set once the audit store is open
+final _crashQueue = <String>[]; // crashes before the store opens, capped at 20
+String? _lastCrash;
+DateTime _lastCrashAt = DateTime.fromMillisecondsSinceEpoch(0);
+void _logCrash(String message) {
+  final text =
+      'Crash: ${message.length > 300 ? message.substring(0, 300) : message}';
+  debugPrint(text);
+  final now = DateTime.now();
+  if (text == _lastCrash && now.difference(_lastCrashAt).inSeconds < 5) return;
+  _lastCrash = text;
+  _lastCrashAt = now;
+  final audit = _crashAudit;
+  if (audit != null) {
+    audit(text);
+  } else if (_crashQueue.length < 20) {
+    _crashQueue.add(text);
+  }
+}
 
 class RemoteLinkApp extends StatelessWidget {
   const RemoteLinkApp({super.key});
@@ -41,8 +69,7 @@ class Dashboard extends ConsumerStatefulWidget {
   ConsumerState<Dashboard> createState() => _DashboardState();
 }
 
-class _DashboardState extends ConsumerState<Dashboard>
-    with WidgetsBindingObserver {
+class _DashboardState extends ConsumerState<Dashboard> {
   final endpoint = TextEditingController(
     text: 'wss://signal.mixed-tools.site/v1/ws',
   );
@@ -62,17 +89,15 @@ class _DashboardState extends ConsumerState<Dashboard>
   String? tvError;
   bool tvLoading = false;
   late final Signaling _signaling; // ref is unusable during dispose
-  final mods = <String>{};
-  bool trackpad = false;
-  double tx = .5, ty = .5;
+  bool _viewPushed = false; // remote view already pushed for this session
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _signaling = ref.read(signalingProvider);
     _signaling.onAudit = _auditEvent;
     _signaling.onSecretUsed = unattendedSecret.clear;
-    scheduleMicrotask(() => unawaited(_signaling.loadTrust())); // not during build
+    scheduleMicrotask(
+        () => unawaited(_signaling.loadTrust())); // not during build
     _openStore();
   }
 
@@ -82,13 +107,6 @@ class _DashboardState extends ConsumerState<Dashboard>
       final audit = await store?.auditEntries();
       if (mounted && audit != null) setState(() => auditEntries = audit);
     } catch (_) {}
-  }
-
-  void _tapKey(Signaling state, String code) {
-    for (final down in const [true, false]) {
-      state.sendInput({'t': 'key', 'code': code, 'down': down});
-    }
-    setState(_releaseMods);
   }
 
   Future<void> _openStore() async {
@@ -102,6 +120,11 @@ class _DashboardState extends ConsumerState<Dashboard>
       }
       setState(() {
         store = opened;
+        _crashAudit = _auditEvent;
+        for (final c in _crashQueue) {
+          _auditEvent(c);
+        }
+        _crashQueue.clear();
         saved = devices;
         auditEntries = audit;
       });
@@ -157,23 +180,15 @@ class _DashboardState extends ConsumerState<Dashboard>
     }
   }
 
-  void _releaseMods() {
-    final signaling = _signaling;
-    for (final m in mods) {
-      signaling.sendInput({'t': 'key', 'code': m, 'down': false});
-    }
-    mods.clear();
-  }
-
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState lifecycle) {
-    if (lifecycle == AppLifecycleState.paused) setState(_releaseMods);
-  }
+  void _openView() => Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => SessionView(signaling: _signaling),
+        ),
+      );
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
-    _releaseMods();
+    if (_crashAudit == _auditEvent) _crashAudit = null;
     final signaling = _signaling;
     signaling.tvHandler = null;
     signaling.onSessionEnded = null;
@@ -198,8 +213,12 @@ class _DashboardState extends ConsumerState<Dashboard>
   Widget build(BuildContext context) {
     final state = ref.watch(signalingProvider);
     if (state.sessionId == null) {
-      mods.clear(); // channel is gone; nothing to release
-      tx = ty = .5;
+      _viewPushed = false;
+    } else if (!state.target && state.rendererReady && !_viewPushed) {
+      _viewPushed = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && state.sessionId != null) _openView();
+      });
     }
     if (state.incomingSession != null &&
         shownIncoming != state.incomingSession) {
@@ -595,6 +614,11 @@ class _DashboardState extends ConsumerState<Dashboard>
                       ),
                       if (state.fileStatus != null) Text(state.fileStatus!),
                       if (state.notice != null) Text(state.notice!),
+                      if (state.target && Platform.isAndroid && state.viewOnly)
+                        TextButton(
+                          onPressed: state.openAccessibilitySettings,
+                          child: const Text('Open settings'),
+                        ),
                       if (state.trustStatus != null) Text(state.trustStatus!),
                       if (state.canTrustController)
                         OutlinedButton(
@@ -603,11 +627,13 @@ class _DashboardState extends ConsumerState<Dashboard>
                             final ok = await showDialog<bool>(
                               context: context,
                               builder: (context) => StatefulBuilder(
-                                builder: (context, setDialogState) => AlertDialog(
+                                builder: (context, setDialogState) =>
+                                    AlertDialog(
                                   title: const Text('Trust this device?'),
                                   content: Column(
                                     mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
                                     children: [
                                       Text(
                                         'It will connect without a prompt as "${state.trustablePreset(allowFull: allowFull)}" until you revoke it in Settings.',
@@ -627,11 +653,13 @@ class _DashboardState extends ConsumerState<Dashboard>
                                   ),
                                   actions: [
                                     TextButton(
-                                      onPressed: () => Navigator.pop(context, false),
+                                      onPressed: () =>
+                                          Navigator.pop(context, false),
                                       child: const Text('Cancel'),
                                     ),
                                     FilledButton(
-                                      onPressed: () => Navigator.pop(context, true),
+                                      onPressed: () =>
+                                          Navigator.pop(context, true),
                                       child: const Text('Trust'),
                                     ),
                                   ],
@@ -661,22 +689,6 @@ class _DashboardState extends ConsumerState<Dashboard>
                           ],
                         ),
                       ],
-                      if (!state.target && state.monitors.length > 1)
-                        DropdownButton<int>(
-                          value: state.display,
-                          isExpanded: true,
-                          hint: const Text('Monitor (input target)'),
-                          onChanged: state.selectDisplay,
-                          items: [
-                            for (final m in state.monitors)
-                              DropdownMenuItem(
-                                value: m.id,
-                                child: Text(
-                                  'Monitor ${m.id + 1} (${m.w}x${m.h})${m.primary ? ' - primary' : ''}',
-                                ),
-                              ),
-                          ],
-                        ),
                       if (!state.target) ...[
                         TextField(
                           controller: outgoingFile,
@@ -694,87 +706,6 @@ class _DashboardState extends ConsumerState<Dashboard>
                         OutlinedButton(
                           onPressed: state.sendClipboard,
                           child: const Text('Send clipboard text'),
-                        ),
-                      if (!state.target)
-                        Wrap(
-                          spacing: 8,
-                          children: [
-                            for (final code in const [
-                              'ControlLeft',
-                              'AltLeft',
-                              'MetaLeft',
-                            ])
-                              FilterChip(
-                                label: Text(
-                                  code == 'MetaLeft'
-                                      ? 'Win'
-                                      : code.substring(0, code.length - 4),
-                                ),
-                                selected: mods.contains(code),
-                                onSelected: (on) {
-                                  state.sendInput({
-                                    't': 'key',
-                                    'code': code,
-                                    'down': on,
-                                  });
-                                  setState(
-                                    () =>
-                                        on ? mods.add(code) : mods.remove(code),
-                                  );
-                                },
-                              ),
-                            for (final code in const [
-                              'Escape',
-                              'Tab',
-                              'Enter',
-                              'Backspace',
-                              'ArrowUp',
-                              'ArrowDown',
-                              'ArrowLeft',
-                              'ArrowRight',
-                            ])
-                              OutlinedButton(
-                                onPressed: () {
-                                  state.sendInput({
-                                    't': 'key',
-                                    'code': code,
-                                    'down': true,
-                                  });
-                                  state.sendInput({
-                                    't': 'key',
-                                    'code': code,
-                                    'down': false,
-                                  });
-                                  // Sticky modifiers apply to one key.
-                                  setState(_releaseMods);
-                                },
-                                child: Text(code),
-                              ),
-                            OutlinedButton(
-                              onPressed: state.sendSecureAttention,
-                              child: const Text('Ctrl+Alt+Del'),
-                            ),
-                            PopupMenuButton<String>(
-                              tooltip: 'More keys',
-                              onSelected: (code) => _tapKey(state, code),
-                              itemBuilder: (context) => [
-                                for (final code in [
-                                  for (var i = 1; i <= 12; i++) 'F$i',
-                                  'Home',
-                                  'End',
-                                  'PageUp',
-                                  'PageDown',
-                                  'Delete',
-                                  'Insert',
-                                ])
-                                  PopupMenuItem(value: code, child: Text(code)),
-                              ],
-                              child: const Padding(
-                                padding: EdgeInsets.all(12),
-                                child: Text('More keys'),
-                              ),
-                            ),
-                          ],
                         ),
                       if (!state.target)
                         Row(
@@ -798,89 +729,10 @@ class _DashboardState extends ConsumerState<Dashboard>
                             ),
                           ],
                         ),
-                      if (!state.target && state.hasAudio)
-                        SwitchListTile(
-                          title: const Text('Mute remote audio'),
-                          value: state.muted,
-                          onChanged: (_) => state.toggleMute(),
-                        ),
-                      if (!state.target)
-                        SwitchListTile(
-                          title: const Text('Trackpad mode'),
-                          value: trackpad,
-                          onChanged: (on) => setState(() {
-                            trackpad = on;
-                            tx = ty = .5;
-                          }),
-                        ),
                       if (!state.target && state.rendererReady)
-                        AspectRatio(
-                          aspectRatio: 16 / 9,
-                          child: LayoutBuilder(
-                            builder: (context, constraints) {
-                              void click() {
-                                for (final down in const [true, false]) {
-                                  state.sendInput({
-                                    't': 'mouse_btn',
-                                    'b': 'left',
-                                    'down': down,
-                                  });
-                                }
-                                setState(_releaseMods);
-                              }
-
-                              return GestureDetector(
-                                onTapDown: trackpad
-                                    ? null
-                                    : (details) {
-                                        final point = mapVideoPointer(
-                                          details.localPosition.dx,
-                                          details.localPosition.dy,
-                                          constraints.maxWidth,
-                                          constraints.maxHeight,
-                                          state.renderer.videoWidth.toDouble(),
-                                          state.renderer.videoHeight.toDouble(),
-                                        );
-                                        if (point == null) return;
-                                        state.sendInput({
-                                          't': 'mouse_move',
-                                          'x': point.x,
-                                          'y': point.y,
-                                        });
-                                        click();
-                                      },
-                                onTap: trackpad ? click : null,
-                                onPanUpdate: trackpad
-                                    ? (details) {
-                                        final vw = state.renderer.videoWidth,
-                                            vh = state.renderer.videoHeight;
-                                        if (constraints.maxWidth <= 0 ||
-                                            constraints.maxHeight <= 0 ||
-                                            vw <= 0 ||
-                                            vh <= 0) {
-                                          return;
-                                        }
-                                        // The protocol has no delta event, so integrate into an absolute position.
-                                        // Deltas are scaled by the letterboxed video rect, as in mapVideoPointer.
-                                        final scale = math.min(
-                                          constraints.maxWidth / vw,
-                                          constraints.maxHeight / vh,
-                                        );
-                                        tx = (tx + details.delta.dx / (vw * scale))
-                                            .clamp(0.0, 1.0);
-                                        ty = (ty + details.delta.dy / (vh * scale))
-                                            .clamp(0.0, 1.0);
-                                        state.sendInput({
-                                          't': 'mouse_move',
-                                          'x': tx,
-                                          'y': ty,
-                                        });
-                                      }
-                                    : null,
-                                child: RTCVideoView(state.renderer),
-                              );
-                            },
-                          ),
+                        OutlinedButton(
+                          onPressed: _openView,
+                          child: const Text('Open remote view'),
                         ),
                     ],
                   ),

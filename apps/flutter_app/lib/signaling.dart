@@ -68,11 +68,16 @@ class Signaling extends ChangeNotifier implements DirectBridge {
   Map<String, dynamic>? fileOffer;
   String? fileStatus;
   MediaStream? _capture;
+  RTCRtpSender? _videoSender;
   final renderer = RTCVideoRenderer();
   bool rendererReady = false;
   bool _remoteDescriptionSet = false;
   bool _peerReady = false;
   bool _startingPeer = false;
+  bool _viewOnly = false;
+
+  /// True when input is off for this session (target: accessibility off; controller: told by target).
+  bool get viewOnly => _viewOnly;
   final _generation = SessionGeneration();
   final List<Map<String, dynamic>> _queuedSignals = [];
   final List<RTCIceCandidate> _pendingIce = [];
@@ -222,10 +227,11 @@ class Signaling extends ChangeNotifier implements DirectBridge {
               false;
           if (!granted || !_generation.isCurrent(generation) || sessionId != id)
             throw StateError('Session notification permission required');
+          final ok = await _androidInputOrViewOnly(inputAllowed);
           await _android.invokeMethod('acceptSession', {
             'sessionId': id,
-            'input': inputAllowed,
-            'clipboardText': _permits('clipboard_text'),
+            'input': ok,
+            'clipboardText': ok,
             'confirmed': true,
           });
           if (!_generation.isCurrent(generation) || sessionId != id) {
@@ -253,6 +259,21 @@ class Signaling extends ChangeNotifier implements DirectBridge {
     if ((kind == 'offer' && !target) || (kind == 'answer' && target))
       throw StateError('Unexpected direct signal role');
     await _handleSignal({'sessionId': sessionId, 'kind': kind, 'data': data});
+  }
+
+  /// Android: input needs the local accessibility service. If it is off, keep the session view-only.
+  Future<bool> _androidInputOrViewOnly(bool input) async {
+    if (!input || !Platform.isAndroid) return input;
+    try {
+      if (await _android.invokeMethod<bool>('isAccessibilityEnabled') == true)
+        return true;
+    } catch (_) {}
+    _viewOnly = true;
+    notice =
+        'View only: turn on Remote Link in Accessibility settings to allow control.';
+    onAudit?.call('Input not allowed: accessibility service is off (view only)');
+    notifyListeners();
+    return false; // the UI offers openAccessibilitySettings() on a button
   }
 
   Future<void> openAccessibilitySettings() async {
@@ -728,7 +749,8 @@ class Signaling extends ChangeNotifier implements DirectBridge {
         notifyListeners();
       }
     } finally {
-      _accepting = false;
+      // A stale accept must not clear the flag of a newer one (_revoke already reset it).
+      if (_generation.isCurrent(generation)) _accepting = false;
     }
   }
 
@@ -806,10 +828,12 @@ class Signaling extends ChangeNotifier implements DirectBridge {
           'Enable session notifications before allowing access',
         );
       if (!_generation.isCurrent(generation) || sessionId != id) return false;
+      final inputOk = await _androidInputOrViewOnly(input);
+      if (!_generation.isCurrent(generation) || sessionId != id) return false;
       await _android.invokeMethod('acceptSession', {
         'sessionId': id,
-        'input': input,
-        'clipboardText': input,
+        'input': inputOk,
+        'clipboardText': inputOk,
         'confirmed': true,
       });
     }
@@ -1338,18 +1362,29 @@ class Signaling extends ChangeNotifier implements DirectBridge {
               'capability': 'view',
             }),
           )) {
-        final serviceStarted = await _captureService(true);
+        if (Platform.isAndroid) {
+          // Android 14+: projection consent first, then the mediaProjection foreground service, then capture.
+          bool consent = false;
+          try {
+            consent = await Helper.requestCapturePermission();
+          } catch (_) {}
+          if (!live()) return;
+          if (!consent) throw StateError('Screen capture permission was denied');
+          if (!await _captureService(true))
+            throw StateError('Screen capture service failed to start');
+          if (!live()) return;
+        }
         final capture = await navigator.mediaDevices.getDisplayMedia({
           'video': _captureSource == null
               ? true
               : {
                   'deviceId': {'exact': _captureSource},
-                  'mandatory': {'frameRate': 30.0},
+                  'optional': [
+                    {'frameRate': 30.0},
+                  ],
                 },
           'audio': _audioAllowed(startingSession),
         });
-        // Android 14 refuses the service before projection consent: retry once now.
-        if (!serviceStarted) await _captureService(true);
         if (!live()) {
           for (final track in capture.getTracks()) {
             await track.stop();
@@ -1362,26 +1397,7 @@ class Signaling extends ChangeNotifier implements DirectBridge {
           track.enabled = !_authPending; // black until the controller authenticates
           final sender = await pc.addTrack(track, capture);
           if (!live()) return;
-          if (track.kind == 'video') {
-            final parameters = sender.parameters;
-            final encodings = parameters.encodings;
-            if (encodings == null || encodings.isEmpty) {
-              error = 'Video quality controls unavailable on this device';
-            } else {
-              final bitrate = _quality == 'low'
-                  ? 800000
-                  : _quality == 'high'
-                      ? 5000000
-                      : 2000000;
-              for (final encoding in encodings) {
-                encoding.maxBitrate = bitrate;
-                encoding.maxFramerate = _quality == 'low' ? 20 : 30;
-              }
-              if (!await sender.setParameters(parameters))
-                error = 'Video quality controls were rejected';
-              if (!live()) return;
-            }
-          }
+          if (track.kind == 'video') _videoSender = sender; // encodings exist only after negotiation
         }
       } else if (!target) {
         await pc.addTransceiver(
@@ -1435,8 +1451,40 @@ class Signaling extends ChangeNotifier implements DirectBridge {
       end();
       notifyListeners();
     } finally {
-      _startingPeer = false;
+      // A newer session owns the flag once this run's generation is stale (_revoke reset it).
+      if (_generation.isCurrent(generation)) _startingPeer = false;
     }
+  }
+
+  /// Sender bitrate cap for the chosen quality, set after setLocalDescription.
+  /// Steps down 5M -> 2M -> 800k when rejected; never a user-visible error.
+  Future<void> _applyQuality() async {
+    final sender = _videoSender;
+    if (sender == null) return;
+    final generation = _generation.current;
+    final bitrates = _quality == 'low'
+        ? [800000]
+        : _quality == 'high'
+            ? [5000000, 2000000, 800000]
+            : [2000000, 800000];
+    for (final bitrate in bitrates) {
+      if (!_generation.isCurrent(generation) || _videoSender != sender) return;
+      try {
+        final parameters = sender.parameters;
+        final encodings = parameters.encodings;
+        if (encodings == null || encodings.isEmpty) {
+          onAudit?.call('Video quality controls unavailable on this device');
+          return;
+        }
+        for (final encoding in encodings) {
+          encoding.maxBitrate = bitrate;
+          encoding.maxFramerate = _quality == 'low' ? 20 : 30;
+        }
+        if (await sender.setParameters(parameters)) return;
+      } catch (_) {}
+    }
+    if (_generation.isCurrent(generation))
+      onAudit?.call('Video quality controls were rejected; using encoder defaults');
   }
 
   bool _validDirectSignal(String kind, Map<String, dynamic> data) {
@@ -1534,6 +1582,7 @@ class Signaling extends ChangeNotifier implements DirectBridge {
         await pc.setLocalDescription(answer);
         if (!live()) return;
         _signal('answer', {'sdp': answer.sdp, 'type': answer.type});
+        await _applyQuality();
       }
     }
   }
@@ -1556,6 +1605,17 @@ class Signaling extends ChangeNotifier implements DirectBridge {
         if (state == RTCDataChannelState.RTCDataChannelOpen) hello();
       };
       if (channel.state == RTCDataChannelState.RTCDataChannelOpen) hello();
+    } else if (_viewOnly) {
+      // Tell the controller once the channel is open so its UI can hide input.
+      void announce() {
+        if (_generation.isCurrent(generation) && sessionId == boundSession)
+          _sendControl({'t': 'view_only'});
+      }
+
+      channel.onDataChannelState = (state) {
+        if (state == RTCDataChannelState.RTCDataChannelOpen) announce();
+      };
+      if (channel.state == RTCDataChannelState.RTCDataChannelOpen) announce();
     }
     channel.onMessage = (message) async {
       if (!_generation.isCurrent(generation) ||
@@ -1602,6 +1662,7 @@ class Signaling extends ChangeNotifier implements DirectBridge {
           });
           return;
         }
+        if (_viewOnly) return; // input and clipboard are off: drop quietly
         if (event['t'] == 'clipboard_text') {
           final value = event['text'];
           if (value is! String || value.length > 2048) return;
@@ -1784,6 +1845,10 @@ class Signaling extends ChangeNotifier implements DirectBridge {
       case 'display':
         final d = event['display'];
         if (d is int && monitors.any((m) => m.id == d)) display = d;
+        break;
+      case 'view_only':
+        _viewOnly = true;
+        notice = 'View only: remote device has control disabled';
         break;
       case 'notice':
         final text = event['text'];
@@ -2077,7 +2142,7 @@ class Signaling extends ChangeNotifier implements DirectBridge {
   void sendInput(Map<String, dynamic> event) {
     final capability =
         event['t'] == 'clipboard_text' ? 'clipboard_text' : 'input';
-    if (!target && sessionId != null && _permits(capability)) {
+    if (!target && sessionId != null && !_viewOnly && _permits(capability)) {
       final d = display;
       if (d != null && (event['t'] == 'mouse_move' || event['t'] == 'touch'))
         event = {...event, 'display': d};
@@ -2278,9 +2343,22 @@ class Signaling extends ChangeNotifier implements DirectBridge {
     _iceRetry?.cancel();
     _iceRetry = null;
     _iceAttempt = 0;
-    if (target && Platform.isAndroid) {
-      _android.invokeMethod('revokeSession');
+    if (Platform.isAndroid) {
+      // Each call is independent; revokeSession (target only) also stops SessionIndicatorService.
+      for (final method in [
+        'stopCaptureService',
+        if (target) 'revokeSession',
+      ]) {
+        _android.invokeMethod(method).catchError((Object e) {
+          onAudit?.call('$method failed: $e');
+        });
+      }
     }
+    _captureServiceOn = false;
+    _accepting = false;
+    _startingPeer = false;
+    _viewOnly = false;
+    _videoSender = null;
     for (final pending in _tvPending.values) {
       if (!pending.isCompleted)
         pending.completeError(StateError('Session ended'));
@@ -2299,14 +2377,17 @@ class Signaling extends ChangeNotifier implements DirectBridge {
     fileOffer = null;
     _channel?.close();
     _channel = null;
-    _pc?.close();
-    _pc = null;
-    for (final track in _capture?.getTracks() ?? <MediaStreamTrack>[]) {
-      track.stop();
+    try {
+      _pc?.close();
+      for (final track in _capture?.getTracks() ?? <MediaStreamTrack>[]) {
+        track.stop();
+      }
+      _capture?.dispose();
+    } catch (e) {
+      onAudit?.call('Media teardown failed: $e');
     }
-    _capture?.dispose();
+    _pc = null;
     _capture = null;
-    unawaited(_captureService(false));
     _remoteAudio = null;
     muted = false;
     _switching = false;

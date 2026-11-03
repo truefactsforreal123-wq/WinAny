@@ -71,6 +71,7 @@ class MainActivity : FlutterActivity() {
                             result.success(false)
                         }
                     }
+                    "isAccessibilityEnabled" -> result.success(RemoteAccessibilityService.instance != null)
                     "openAccessibilitySettings" -> {
                         require(args["disclosureAccepted"] == true) { "Accessibility disclosure must be accepted" }
                         startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
@@ -87,16 +88,26 @@ class MainActivity : FlutterActivity() {
                         result.success(true)
                     }
                     "startCaptureService" -> {
+                        // startForeground runs async in onStartCommand: poll its outcome (max ~2 s).
+                        CaptureService.state = 0
                         startForegroundService(Intent(this, CaptureService::class.java))
-                        result.success(true)
+                        val handler = Handler(Looper.getMainLooper())
+                        var tries = 0
+                        fun poll() {
+                            if (CaptureService.state == 1) result.success(true)
+                            else if (CaptureService.state == -1 || ++tries > 40)
+                                result.error("remote_platform", "Screen capture service failed to start", null)
+                            else handler.postDelayed({ poll() }, 50)
+                        }
+                        poll()
                     }
                     "stopCaptureService" -> {
                         stopService(Intent(this, CaptureService::class.java))
                         result.success(true)
                     }
                     "revokeSession" -> {
-                        SessionGate.revoke()
-                        stopService(Intent(this, SessionIndicatorService::class.java))
+                        try { SessionGate.revoke() }
+                        finally { stopService(Intent(this, SessionIndicatorService::class.java)) }
                         result.success(true)
                     }
                     "injectInput" -> {
