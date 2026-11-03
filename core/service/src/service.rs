@@ -54,9 +54,13 @@ fn install() -> Result<(), String> {
     // canonicalize = GetFinalPathNameByHandleW: junctions/symlinks resolved before checking.
     let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|e| e.to_string())?;
     let exe = match exe.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
-        Some(s) if !s.starts_with("UNC\\") => std::path::PathBuf::from(s),
-        _ => return Err("install from a local drive (UNC and non-UTF-8 paths are refused)".into()),
+        Some(s) if !s.starts_with("UNC\\") && win32_stable(s) => std::path::PathBuf::from(s),
+        _ => return Err("install from a plain local path (UNC, non-UTF-8 and names ending in '.' or ' ' are refused)".into()),
     };
+    // The stripped path is re-parsed by Win32 (and by the SCM at start): it must resolve to the same file.
+    if std::fs::canonicalize(&exe).map_err(|e| e.to_string())?.to_str().and_then(|s| s.strip_prefix(r"\\?\")) != exe.to_str() {
+        return Err("install path changes under Win32 normalization".into());
+    }
     // The service runs this folder's binaries as SYSTEM: refuse folders non-admins can write.
     unsafe {
         let dir = exe.parent().ok_or("no install folder")?;
@@ -93,6 +97,11 @@ fn sid_may_own(sid: &str) -> bool { sid_may_write(sid, false) }
 
 /// Every folder above `dir`, nearest first, up to the drive root.
 fn ancestors_of(dir: &Path) -> Vec<&Path> { dir.ancestors().skip(1).collect() }
+
+/// False if Win32 path parsing would rewrite `path` (a name ending in '.' or ' ', or a '.'/'..' component).
+fn win32_stable(path: &str) -> bool {
+    path.split('\\').skip(1).all(|c| !c.is_empty() && !c.ends_with('.') && !c.ends_with(' '))
+}
 
 unsafe fn sid_string(sid: PSID) -> Result<String, String> {
     let mut s: PWSTR = null_mut();
@@ -146,6 +155,13 @@ mod tests {
         let a = ancestors_of(Path::new(r"C:\Program Files\RemoteLink"));
         assert_eq!(a, [Path::new(r"C:\Program Files"), Path::new(r"C:\")]);
         assert!(ancestors_of(Path::new(r"C:\")).is_empty());
+    }
+    #[test]
+    fn win32_stable_paths() {
+        assert!(win32_stable(r"C:\Program Files\RemoteLink\remote_link-service.exe"));
+        for bad in [r"C:\Evil.\svc.exe", r"C:\Evil \svc.exe", r"C:\a\..\svc.exe", r"C:\a\\svc.exe"] {
+            assert!(!win32_stable(bad), "{bad}");
+        }
     }
     #[test]
     fn sid_allowlist() {
