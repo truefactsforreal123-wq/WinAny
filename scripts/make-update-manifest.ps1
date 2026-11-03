@@ -13,11 +13,12 @@ $ErrorActionPreference = 'Stop'
 $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $File).Hash.ToLower()
 $sig = ''
 if ($PrivateKeyFile) {
-    # Signs the 32 raw sha256 bytes; signature stored base64.
+    # Signs "remote-link-update-v1\0" version "\0" platform "\0" + 32 raw sha256 bytes; signature stored base64.
     $tmp = (New-TemporaryFile).FullName
     try {
-        $bytes = [byte[]]::new(32)
-        for ($i = 0; $i -lt 32; $i++) { $bytes[$i] = [Convert]::ToByte($sha.Substring(2 * $i, 2), 16) }
+        $hash = [byte[]]::new(32)
+        for ($i = 0; $i -lt 32; $i++) { $hash[$i] = [Convert]::ToByte($sha.Substring(2 * $i, 2), 16) }
+        $bytes = [byte[]]([Text.Encoding]::UTF8.GetBytes("remote-link-update-v1`0$Version`0$Platform`0")) + $hash
         [IO.File]::WriteAllBytes($tmp, $bytes)
         & openssl pkeyutl -sign -inkey $PrivateKeyFile -rawin -in $tmp -out "$tmp.sig"
         if ($LASTEXITCODE -ne 0) { throw 'openssl signing failed' }

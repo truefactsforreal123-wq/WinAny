@@ -54,8 +54,10 @@ fn install() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     // The service runs this folder's binaries as SYSTEM: refuse folders non-admins can write.
     unsafe {
-        check_acl(exe.parent().ok_or("no install folder")?)?;
-        check_acl(&exe)?;
+        let dir = exe.parent().ok_or("no install folder")?;
+        check_acl(dir, false)?;
+        check_acl(&exe, false)?;
+        if let Some(p) = dir.parent() { check_acl(p, true)?; }
     }
     let cmd = w(&format!("\"{}\" run", exe.display()));
     unsafe {
@@ -75,28 +77,50 @@ fn install() -> Result<(), String> {
     Ok(())
 }
 
-/// Fails if Everyone, Authenticated Users, Users or INTERACTIVE may write, delete or re-ACL
-/// `path`. Inherit-only ACEs count too, since they apply to the files inside.
-/// shortcut: deny ACEs and the parent folder are not evaluated; installer pins Program Files.
-unsafe fn check_acl(path: &Path) -> Result<(), String> {
+const TRUSTED_INSTALLER: &str = "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+
+/// Allowlist: only SYSTEM, Administrators and TrustedInstaller (plus CREATOR OWNER on
+/// inherit-only ACEs) may hold write rights; `owner` ids must be SYSTEM/Administrators/TrustedInstaller.
+fn sid_may_write(sid: &str, inherit_only: bool) -> bool {
+    matches!(sid, "S-1-5-18" | "S-1-5-32-544") || sid == TRUSTED_INSTALLER || (inherit_only && sid == "S-1-3-0")
+}
+fn sid_may_own(sid: &str) -> bool { sid_may_write(sid, false) }
+
+unsafe fn sid_string(sid: PSID) -> Result<String, String> {
+    let mut s: PWSTR = null_mut();
+    if ConvertSidToStringSidW(sid, &mut s) == 0 { return Err(last("ConvertSidToStringSid")); }
+    let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, (0..).take_while(|&i| *s.add(i) != 0).count()));
+    LocalFree(s as HLOCAL);
+    Ok(out)
+}
+
+/// Fails if the owner of `path` or any ACCESS_ALLOWED ACE (inherit-only included, it applies to
+/// the files inside) grants write/delete/re-ACL to a SID outside the allowlist. For the parent
+/// folder (`parent`) only rename/delete/re-ACL rights on non-inherit-only ACEs matter.
+/// shortcut: deny ACEs are not evaluated; allow ACEs for other SIDs are rejected even if a deny cancels them.
+unsafe fn check_acl(path: &Path, parent: bool) -> Result<(), String> {
     const WRITE: u32 = FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL | GENERIC_WRITE;
-    let (mut dacl, mut sd): (*mut ACL, PSECURITY_DESCRIPTOR) = (null_mut(), null_mut());
-    let err = GetNamedSecurityInfoW(w(&path.to_string_lossy()).as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
-        null_mut(), null_mut(), &mut dacl, null_mut(), &mut sd);
+    const PARENT_WRITE: u32 = FILE_DELETE_CHILD | DELETE | WRITE_DAC | WRITE_OWNER | GENERIC_ALL | GENERIC_WRITE;
+    let (mut dacl, mut sd, mut owner): (*mut ACL, PSECURITY_DESCRIPTOR, PSID) = (null_mut(), null_mut(), null_mut());
+    let err = GetNamedSecurityInfoW(w(&path.to_string_lossy()).as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+        &mut owner, null_mut(), &mut dacl, null_mut(), &mut sd);
     if err != 0 { return Err(format!("GetNamedSecurityInfo failed: {err}")); }
     let result = (|| {
         if dacl.is_null() { return Err(format!("{} has no DACL", path.display())); }
+        if owner.is_null() { return Err(format!("{} has no owner", path.display())); }
+        let o = sid_string(owner)?;
+        if !sid_may_own(&o) { return Err(format!("{} is owned by {o}; install into Program Files", path.display())); }
         for i in 0..(*dacl).AceCount as u32 {
             let mut ace = null_mut();
             if GetAce(dacl, i, &mut ace) == 0 { return Err(last("GetAce")); }
-            if (*(ace as *const ACE_HEADER)).AceType != 0 { continue; } // 0 = ACCESS_ALLOWED_ACE_TYPE
+            let hdr = &*(ace as *const ACE_HEADER);
+            if hdr.AceType != 0 { continue; } // 0 = ACCESS_ALLOWED_ACE_TYPE
+            let inherit_only = hdr.AceFlags & INHERIT_ONLY_ACE as u8 != 0;
+            if parent && inherit_only { continue; }
             let ace = &*(ace as *const ACCESS_ALLOWED_ACE);
-            if ace.Mask & WRITE == 0 { continue; }
-            let mut s: PWSTR = null_mut();
-            if ConvertSidToStringSidW(&ace.SidStart as *const u32 as PSID, &mut s) == 0 { return Err(last("ConvertSidToStringSid")); }
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(s, (0..).take_while(|&i| *s.add(i) != 0).count()));
-            LocalFree(s as HLOCAL);
-            if ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4"].contains(&sid.as_str()) {
+            if ace.Mask & if parent { PARENT_WRITE } else { WRITE } == 0 { continue; }
+            let sid = sid_string(&ace.SidStart as *const u32 as PSID)?;
+            if !sid_may_write(&sid, inherit_only) {
                 return Err(format!("{} is writable by {sid}; install into Program Files", path.display()));
             }
         }
@@ -104,6 +128,20 @@ unsafe fn check_acl(path: &Path) -> Result<(), String> {
     })();
     LocalFree(sd as HLOCAL);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sid_allowlist() {
+        for s in ["S-1-5-18", "S-1-5-32-544", TRUSTED_INSTALLER] { assert!(sid_may_write(s, false) && sid_may_own(s)); }
+        assert!(sid_may_write("S-1-3-0", true));
+        assert!(!sid_may_write("S-1-3-0", false) && !sid_may_own("S-1-3-0"));
+        for s in ["S-1-1-0", "S-1-5-11", "S-1-5-32-545", "S-1-5-4", "S-1-5-32-547", "S-1-5-21-1-2-3-1001"] {
+            assert!(!sid_may_write(s, false) && !sid_may_write(s, true) && !sid_may_own(s));
+        }
+    }
 }
 
 /// Stops the service and waits (max 30 s) for STOPPED so installers can replace files.

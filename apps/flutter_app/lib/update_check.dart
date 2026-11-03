@@ -44,6 +44,12 @@ bool isNewer(String a, String b) {
   return false;
 }
 
+/// Signed message: "remote-link-update-v1\0" || version || "\0" || platform || "\0" || sha256 bytes.
+List<int> updateMessage(String version, String platform, List<int> digest) => [
+      ...utf8.encode('remote-link-update-v1\x00$version\x00$platform\x00'),
+      ...digest,
+    ];
+
 /// Steps 3, 4 and 6 of packaging/UPDATE.md. True only if hash and signature both pass.
 Future<bool> verifyUpdate(
   List<int> file,
@@ -55,11 +61,20 @@ Future<bool> verifyUpdate(
   try {
     final expected = manifest['sha256'];
     final sig = manifest['signature'];
-    if (expected is! String || sig is! String || sig.isEmpty) return false;
+    final version = manifest['version'];
+    final platform = manifest['platform'];
+    if (expected is! String ||
+        sig is! String ||
+        sig.isEmpty ||
+        version is! String ||
+        platform is! String) {
+      return false;
+    }
     final digest = await sha256(file);
     final hex = digest.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
     if (digest.length != 32 || hex != expected.toLowerCase()) return false;
-    return await verify(base64Decode(publicKeyB64), digest, base64Decode(sig));
+    return await verify(base64Decode(publicKeyB64),
+        updateMessage(version, platform, digest), base64Decode(sig));
   } catch (_) {
     return false;
   }
