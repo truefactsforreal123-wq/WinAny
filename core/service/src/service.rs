@@ -51,13 +51,18 @@ pub fn main() -> i32 {
 }
 
 fn install() -> Result<(), String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // canonicalize = GetFinalPathNameByHandleW: junctions/symlinks resolved before checking.
+    let exe = std::env::current_exe().and_then(std::fs::canonicalize).map_err(|e| e.to_string())?;
+    let exe = match exe.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(s) if !s.starts_with("UNC\\") => std::path::PathBuf::from(s),
+        _ => return Err("install from a local drive (UNC and non-UTF-8 paths are refused)".into()),
+    };
     // The service runs this folder's binaries as SYSTEM: refuse folders non-admins can write.
     unsafe {
         let dir = exe.parent().ok_or("no install folder")?;
         check_acl(dir, false)?;
         check_acl(&exe, false)?;
-        if let Some(p) = dir.parent() { check_acl(p, true)?; }
+        for p in ancestors_of(dir) { check_acl(p, true)?; }
     }
     let cmd = w(&format!("\"{}\" run", exe.display()));
     unsafe {
@@ -85,6 +90,9 @@ fn sid_may_write(sid: &str, inherit_only: bool) -> bool {
     matches!(sid, "S-1-5-18" | "S-1-5-32-544") || sid == TRUSTED_INSTALLER || (inherit_only && sid == "S-1-3-0")
 }
 fn sid_may_own(sid: &str) -> bool { sid_may_write(sid, false) }
+
+/// Every folder above `dir`, nearest first, up to the drive root.
+fn ancestors_of(dir: &Path) -> Vec<&Path> { dir.ancestors().skip(1).collect() }
 
 unsafe fn sid_string(sid: PSID) -> Result<String, String> {
     let mut s: PWSTR = null_mut();
@@ -133,6 +141,12 @@ unsafe fn check_acl(path: &Path, parent: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ancestors_reach_drive_root() {
+        let a = ancestors_of(Path::new(r"C:\Program Files\RemoteLink"));
+        assert_eq!(a, [Path::new(r"C:\Program Files"), Path::new(r"C:\")]);
+        assert!(ancestors_of(Path::new(r"C:\")).is_empty());
+    }
     #[test]
     fn sid_allowlist() {
         for s in ["S-1-5-18", "S-1-5-32-544", TRUSTED_INSTALLER] { assert!(sid_may_write(s, false) && sid_may_own(s)); }
